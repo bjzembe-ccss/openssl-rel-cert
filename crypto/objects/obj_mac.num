@@ -1245,3 +1245,4 @@ p384_sphincssha2192fsimple		1246
 sphincsshake128fsimple		1247
 p256_sphincsshake128fsimple		1248
 rsa3072_sphincsshake128fsimple		1249
+relatedCertRequest		1250

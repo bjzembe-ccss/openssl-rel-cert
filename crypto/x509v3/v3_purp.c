@@ -290,7 +290,9 @@ int X509_supported_extension(X509_EXTENSION *ex)
         NID_proxyCertInfo,      /* 663 */
         NID_name_constraints,   /* 666 */
         NID_policy_mappings,    /* 747 */
-        NID_inhibit_any_policy  /* 748 */
+        NID_inhibit_any_policy, /* 748 */
+        NID_relatedCertRequest  /* 1250 */
+
     };
 
     int ex_nid = OBJ_obj2nid(X509_EXTENSION_get_object(ex));
