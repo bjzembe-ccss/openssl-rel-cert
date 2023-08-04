@@ -164,29 +164,54 @@ int validate_certificate(char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509
         }
     }
 
-    int succeeded = validate_issuer_and_serial(tmp_file_name, issuer_and_serial);
+    // get trusted CA root cert
+    //TODO: not hardcode the trusted cert
+    char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
+    BIO *trusted_bio = BIO_new_file(trusted_file, "r");
+    X509 *trusted_cert = PEM_read_bio_X509(trusted_bio, NULL, 0, NULL);    
+
+    // load related cert file into BIO
+    BIO *rel_bio = BIO_new_file(tmp_file_name, "r");
+
+    // extract related cert into X509 object
+    X509 *rel_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
+
+    // verify issuers and serial numbers match
+    char* issuer;
+    char* serial;
+    int succeeded = validate_issuer_and_serial(tmp_file_name, issuer_and_serial, &issuer, &serial);
 
     if(!succeeded) {
         return 0;
     }
 
+    // verify the binary time is sufficiently fresh
     succeeded = validate_binary_time(binary_time);
 
     if(!succeeded) {
         return 0;
     }
 
-    succeeded = validate_related_cert(tmp_file_name, ctx);
+    // validate the related certificate
+    succeeded = validate_related_cert(trusted_cert, rel_cert);
 
     if(!succeeded) {
         return 0;
     }
 
+    // verify the referenced signature value using the extracted public key
+    succeeded = verify_signature(signature, rel_cert, binary_time, issuer, serial);
+
+    if(!succeeded) {
+        return 0;
+    }
+
+
     return 1;
 }
 
-int validate_issuer_and_serial(char* tmp_file_name, char* issuer_and_serial) {
-    char oqs_loc[512] = "/home/ubuntu/related_certs/related_certs_oqs/apps/openssl";
+int validate_issuer_and_serial(char* tmp_file_name, char* issuer_and_serial, char** issuer, char** serial) {
+    char oqs_loc[512] = "/home/ubuntu/public_related_certs/openssl-rel-cert/apps/openssl";
     char issuer_file_name[512] = "./TMP_ISSUER.txt";
     char issuer_cmd[512] = "";
     strcat(issuer_cmd, oqs_loc);
@@ -231,6 +256,11 @@ int validate_issuer_and_serial(char* tmp_file_name, char* issuer_and_serial) {
     remove(issuer_file_name);
     remove(serial_file_name);
 
+    // extract issuer & serial values
+    
+    *issuer = issuer_buff + 7;
+    *serial = serial_buff + 7;
+
     return !strcmp(issuer_and_serial, rel_issuer_and_serial);
 }
 
@@ -244,7 +274,7 @@ int validate_binary_time(unsigned int binary_time) {
 int extract_fingerprint(char* tmp_file_name, char** fingerprint) {
     // TODO: use the correct hashing algorithm
     // TODO: do this programmatically instead of through a shell command
-    char oqs_loc[512] = "/home/ubuntu/related_certs/related_certs_oqs/apps/openssl";
+    char oqs_loc[512] = "/home/ubuntu/public_related_certs/openssl-rel-cert/apps/openssl";
     char fingerprint_file_name[512] = "./TMP_FINGERPRINT.txt";
     char fingerprint_cmd[512] = "";
     strcat(fingerprint_cmd, oqs_loc);
@@ -283,24 +313,13 @@ int extract_fingerprint(char* tmp_file_name, char** fingerprint) {
     return 1;
 }
 
-int validate_related_cert(char* cert_file_name) {
+int validate_related_cert(X509* trusted_cert, X509* rel_cert) {
     /*TODO:
         - create the X509* rel cert variable earlier in the process
         - pass the x509* variable to this function
         - implement other verification functions using the X509* variable
             instead of through system commands
     */
-
-    //TODO: not hardcode the trusted cert
-    char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
-    BIO *trusted_bio = BIO_new_file(trusted_file, "r");
-    X509 *trusted_cert = PEM_read_bio_X509(trusted_bio, NULL, 0, NULL);    
-
-    // load related cert file into BIO
-    BIO *rel_bio = BIO_new_file(cert_file_name, "r");
-
-    // extract related cert into X509 object
-    X509 *rel_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
 
     // create store containing the (trusted) cert used to sign the related cert
     X509_STORE* store = X509_STORE_new();
@@ -329,27 +348,48 @@ int validate_related_cert(char* cert_file_name) {
     return 1;
 }
 
-int verify_signature(char* cert) {
-    printf("cert value: %s\n", cert);
+int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, const char* issuer, const char* serial) {
+    /*
+        The signature field contains a digital signature over the
+        concatenation of DER encoded requestTime and IssuerAndSerialNumber
+    */
+    // reconstruct the signed data
+    // TODO: signed_data ?= concat(DER(time), DER(iss and ser))
 
-    BIO *bio = BIO_new(BIO_s_file());
-    if(BIO_read_filename(bio, cert) <= 0) {
-        BIO_free(bio);
+    char data[256];
+    sprintf(data, "%u", requestTime);
+
+    int data_len = strlen(data) + strlen(issuer) + strlen(serial);
+
+    strcat(data, issuer);
+    strcat(data, serial);
+    data[data_len] = '\0';
+
+    // extract public key from related certificate
+    EVP_PKEY *pkey = X509_get0_pubkey(rel_cert);
+    EVP_PKEY_CTX *pkey_ctx = EVP_PKEY_CTX_new(pkey, NULL);
+
+    // convert hex to binary
+    long siglen;
+    unsigned char *bin_signature = OPENSSL_hexstr2buf(signature, &siglen);
+
+    // initialize verification procedure
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    int ok = EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, pkey);
+    ok &= EVP_DigestVerifyUpdate(mdctx, data, data_len);
+
+    if(ok != 1) {
+        printf("ERROR IN SIGNATURE INITIALIZATION: %d\n", ok);
         return 0;
     }
 
-    // extract request object
-    X509_REQ *req = PEM_read_bio_X509_REQ(bio, NULL, NULL, NULL);
+    // verify signature
+    ok = EVP_DigestVerifyFinal(mdctx, bin_signature, siglen);
 
-    /*printf("req data: %s\n", */
-    /*EVP_PKEY *pkey = X509_REQ_get_pubkey(*/
-
-    /*X509_ALGOR algo = rel_cert->sig_alg;*/
-    /*ASN1_BIT_STRING signature = rel_cert->signature;*/
-    /*char* sig_str = signature.data;*/
-    /*X509_PUBKEY* rel_pub_key = rel_cert->cert_info.key;*/
-
-    /*printf("sig_str: %s\n", sig_str);*/
+    if (ok != 1) {
+        printf("ERROR IN SIGNATURE VERIFICATION: %d\n", ok);
+        return 0;
+    }
 
     return 1;
 }
