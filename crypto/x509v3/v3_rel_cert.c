@@ -35,6 +35,8 @@
 
 /*#include "crypto/x509/x_pubkey.c"*/
 
+const char* tmp_file_name = "./TMP_REL_CERT.crt";
+
 struct X509_pubkey_st {
     X509_ALGOR *algor;
     ASN1_BIT_STRING *public_key;
@@ -60,32 +62,25 @@ static int i2r_rel_cert(X509V3_EXT_METHOD *method, RELATED_CERTIFICATE *rel_cert
 static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STACK_OF(CONF_VALUE) *values) {
     RELATED_CERTIFICATE* rel_cert = RELATED_CERTIFICATE_new();
 
-    char* tmp_file_name = "./TMP_REL_CERT.crt";
-    FILE* tmp_file = fopen(tmp_file_name, "w");
-
-    if(!tmp_file) {
-        RELATED_CERTIFICATE_free(rel_cert);
-        return NULL;
-    }
-
     // pull related certificate into temporary file
-    int succeeded = get_related_cert(tmp_file, values);
+    X509 rel_cert_x509;
+    int succeeded = get_related_cert(&rel_cert_x509, values);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
-    fclose(tmp_file);
 
     // validate certificate
-    succeeded = validate_certificate(tmp_file_name, values, ctx);
+    succeeded = validate_certificate(&rel_cert_x509, tmp_file_name, values, ctx);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
-
+    
     // extract fingerprint from related certificate
     unsigned char* fingerprint;
-    succeeded = extract_fingerprint(tmp_file_name, &fingerprint);
+    unsigned int finger_len;
+    succeeded = extract_fingerprint(&rel_cert_x509, tmp_file_name, &fingerprint, &finger_len);
     
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
@@ -98,12 +93,12 @@ static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STAC
 
     rel_cert->RelatedCertificate = *value_asn1;
 
-    // remove tmp files
+    // cleanup
     remove(tmp_file_name);
     return rel_cert;
 }
 
-int get_related_cert(FILE* tmp_file, STACK_OF(CONF_VALUE)* values) {
+int get_related_cert(X509* rel_cert, STACK_OF(CONF_VALUE)* values) {
     /** TODO:
       * instead of accessing a local filepath, perform the following:
       *   - extract accessLocation from values
@@ -123,6 +118,12 @@ int get_related_cert(FILE* tmp_file, STACK_OF(CONF_VALUE)* values) {
     /*curl_easy_cleanup(curl);*/
     /*}*/
 
+    FILE* tmp_file = fopen(tmp_file_name, "w");
+
+    if(!tmp_file) {
+        return 0;
+    }
+
     FILE* in_file = fopen("/home/ubuntu/ra/related-certs-ra/certs/signed_rsa4096.crt", "r");
     if(!in_file) {
         return 0;
@@ -138,13 +139,26 @@ int get_related_cert(FILE* tmp_file, STACK_OF(CONF_VALUE)* values) {
 
     // cleanup
     fclose(in_file);
+    fclose(tmp_file);
+
+    // load related cert file into BIO
+    BIO *rel_bio = BIO_new_file(tmp_file_name, "r");
+
+    // extract related cert into X509 object
+    X509* retrieved_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
+
+    if(!retrieved_cert) {
+        printf("ERROR RETRIEVING RELATED CERTIFICATE\n");
+        return 0;
+    }
+
+    *rel_cert = *retrieved_cert;
 
     return 1;
 } 
 
-int validate_certificate(char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509V3_CTX *ctx) {
+int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509V3_CTX *ctx) {
     // extract variables
-
     unsigned int binary_time;
     char* issuer_and_serial;
     char* signature;
@@ -169,12 +183,6 @@ int validate_certificate(char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509
     char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
     BIO *trusted_bio = BIO_new_file(trusted_file, "r");
     X509 *trusted_cert = PEM_read_bio_X509(trusted_bio, NULL, 0, NULL);    
-
-    // load related cert file into BIO
-    BIO *rel_bio = BIO_new_file(tmp_file_name, "r");
-
-    // extract related cert into X509 object
-    X509 *rel_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
 
     // verify issuers and serial numbers match
     char* issuer;
@@ -205,7 +213,6 @@ int validate_certificate(char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509
     if(!succeeded) {
         return 0;
     }
-
 
     return 1;
 }
@@ -271,44 +278,23 @@ int validate_binary_time(unsigned int binary_time) {
     return diff < (60*60*24*365);
 }
 
-int extract_fingerprint(char* tmp_file_name, char** fingerprint) {
-    // TODO: use the correct hashing algorithm
-    // TODO: do this programmatically instead of through a shell command
-    char oqs_loc[512] = "/home/ubuntu/public_related_certs/openssl-rel-cert/apps/openssl";
-    char fingerprint_file_name[512] = "./TMP_FINGERPRINT.txt";
-    char fingerprint_cmd[512] = "";
-    strcat(fingerprint_cmd, oqs_loc);
-    strcat(fingerprint_cmd, " x509 -noout -fingerprint -sha256 -in ");
-    strcat(fingerprint_cmd, tmp_file_name);
-    strcat(fingerprint_cmd, " -out ");
-    strcat(fingerprint_cmd, fingerprint_file_name);
+int extract_fingerprint(X509* rel_cert, char* tmp_file_name, unsigned char** fingerprint, int* finger_len) {
+    // get the hashing algorithm used on the related cert
+    EVP_MD *alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
 
-    system(fingerprint_cmd);
+    // get digest of the entire related cert
+    unsigned char digest_value[256];
+    unsigned int digest_len = 0;
+    int ok = X509_digest(rel_cert, alg, &digest_value, &digest_len);
 
-    // parse fingerprint
-    FILE* fingerprint_file = fopen(fingerprint_file_name, "r");
-    char fingerprint_buff[2048];
-    fgets(fingerprint_buff, 2048, fingerprint_file);
-
-    char* extracted = strtok(fingerprint_buff, "=");
-    
-    if(!extracted) {
-        // fingerprint calculation failed; no '=' exists
+    if(!ok) {
+        printf("ERROR IN FINGERPRINT EXTRACTION\n");
         return 0;
     }
 
-    // copy value after '=' into fingerprint
-    extracted = strtok(NULL, "=");
-
-    // remove trailing newspace
-    extracted[strlen(extracted)-1] = '\0';
-
-    // overwrite referenced fingerprint value
-    *fingerprint = extracted;
-
-    // cleanup
-    fclose(fingerprint_file);
-    remove(fingerprint_file_name);
+    // convert to hex
+    *fingerprint = OPENSSL_buf2hexstr(digest_value, digest_len);
+    *finger_len = strlen(*fingerprint);
 
     return 1;
 }
@@ -374,8 +360,9 @@ int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, 
     unsigned char *bin_signature = OPENSSL_hexstr2buf(signature, &siglen);
 
     // initialize verification procedure
+    EVP_MD *evp_alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    int ok = EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, pkey);
+    int ok = EVP_DigestVerifyInit(mdctx, NULL, evp_alg, NULL, pkey);
     ok &= EVP_DigestVerifyUpdate(mdctx, data, data_len);
 
     if(ok != 1) {
