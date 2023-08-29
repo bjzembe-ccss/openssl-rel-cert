@@ -80,17 +80,16 @@ static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STAC
     // extract fingerprint from related certificate
     unsigned char* fingerprint;
     unsigned int finger_len;
-    succeeded = extract_fingerprint(&rel_cert_x509, tmp_file_name, &fingerprint, &finger_len);
-    
+    succeeded = extract_fingerprint(&rel_cert_x509, &fingerprint, &finger_len);
+
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
-
+    
     // add fingerprint to attribute
     ASN1_OCTET_STRING* value_asn1 = ASN1_OCTET_STRING_new();
     ASN1_OCTET_STRING_set(value_asn1, fingerprint, strlen((const char *) fingerprint));
-
     rel_cert->RelatedCertificate = *value_asn1;
 
     // cleanup
@@ -179,7 +178,7 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
     }
 
     // get trusted CA root cert
-    //TODO: not hardcode the trusted cert
+    // TODO: not hardcode the trusted cert
     char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
     BIO *trusted_bio = BIO_new_file(trusted_file, "r");
     X509 *trusted_cert = PEM_read_bio_X509(trusted_bio, NULL, 0, NULL);    
@@ -187,7 +186,7 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
     // verify issuers and serial numbers match
     char* issuer;
     char* serial;
-    int succeeded = validate_issuer_and_serial(tmp_file_name, issuer_and_serial, &issuer, &serial);
+    int succeeded = validate_issuer_and_serial(rel_cert, tmp_file_name, issuer_and_serial, &issuer, &serial);
 
     if(!succeeded) {
         return 0;
@@ -195,21 +194,18 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
 
     // verify the binary time is sufficiently fresh
     succeeded = validate_binary_time(binary_time);
-
     if(!succeeded) {
         return 0;
     }
 
     // validate the related certificate
     succeeded = validate_related_cert(trusted_cert, rel_cert);
-
     if(!succeeded) {
         return 0;
     }
 
     // verify the referenced signature value using the extracted public key
     succeeded = verify_signature(signature, rel_cert, binary_time, issuer, serial);
-
     if(!succeeded) {
         return 0;
     }
@@ -217,58 +213,66 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
     return 1;
 }
 
-int validate_issuer_and_serial(char* tmp_file_name, char* issuer_and_serial, char** issuer, char** serial) {
-    char oqs_loc[512] = "/home/ubuntu/public_related_certs/openssl-rel-cert/apps/openssl";
-    char issuer_file_name[512] = "./TMP_ISSUER.txt";
-    char issuer_cmd[512] = "";
-    strcat(issuer_cmd, oqs_loc);
-    strcat(issuer_cmd, " x509 -noout -issuer -in ");
-    strcat(issuer_cmd, tmp_file_name);
-    strcat(issuer_cmd, " -out ");
-    strcat(issuer_cmd, issuer_file_name);
-
-    system(issuer_cmd);
-
-    char serial_file_name[512] = "./TMP_SERIAL.txt";
-    char serial_cmd[512] = "";
-    strcat(serial_cmd, oqs_loc);
-    strcat(serial_cmd, " x509 -noout -serial -in ");
-    strcat(serial_cmd, tmp_file_name);
-    strcat(serial_cmd, " -out ");
-    strcat(serial_cmd, serial_file_name);
-
-    system(serial_cmd);
-
-    // parse issuer and serial
-    FILE* issuer_file = fopen(issuer_file_name, "r");
-    FILE* serial_file = fopen(serial_file_name, "r");
-    char issuer_buff[2048];
-    char serial_buff[2048];
-
-    fgets(issuer_buff, 2048, issuer_file);
-    fgets(serial_buff, 2048, serial_file);
-
-    // remove trailing newlines
-    issuer_buff[strlen(issuer_buff)-1] = '\0';
-    serial_buff[strlen(serial_buff)-1] = '\0';
+int validate_issuer_and_serial(X509* rel_cert, char* tmp_file_name, char* issuer_and_serial, char** issuer, char** serial) {
+    long iss_and_serial_len = strlen(issuer_and_serial);
     
-    char rel_issuer_and_serial[4096] = "";
-    strcat(rel_issuer_and_serial, issuer_buff);
-    strcat(rel_issuer_and_serial, ", ");
-    strcat(rel_issuer_and_serial, serial_buff);
-    
-    // cleanup
-    fclose(issuer_file);
-    fclose(serial_file);
-    remove(issuer_file_name);
-    remove(serial_file_name);
+    // extract issuer data from rel_cert into a BIO
+    BIO *issuer_bio = BIO_new(BIO_s_mem());
+    X509_NAME_print(issuer_bio, rel_cert->cert_info.issuer, 0);
 
-    // extract issuer & serial values
-    
-    *issuer = issuer_buff + 7;
-    *serial = serial_buff + 7;
+    // extract issuer string from bio
+    BUF_MEM *bio_memory;
+    BIO_get_mem_ptr(issuer_bio, &bio_memory);
+    BIO_set_close(issuer_bio, BIO_NOCLOSE);
+    char* rel_issuer = (char *) malloc(bio_memory->length+1);
+    memcpy(rel_issuer, bio_memory->data, bio_memory->length);
+    rel_issuer[bio_memory->length] = '\0';
+    BIO_free(issuer_bio);
 
-    return !strcmp(issuer_and_serial, rel_issuer_and_serial);
+    // extract issuer from extension value
+    char iss_copy[iss_and_serial_len];
+    strcpy(iss_copy, issuer_and_serial);
+
+    char* ext_issuer = strstr(iss_copy, "=");
+    if(ext_issuer[1] == ' ') {
+        // issuer string has a space after =
+        ext_issuer += 2;
+    } else {
+        ext_issuer += 1;
+    }
+
+    ext_issuer[strlen(rel_issuer)] = '\0';
+
+    ASN1_INTEGER rel_serial = rel_cert->cert_info.serialNumber;
+    char* rel_serial_hex = OPENSSL_buf2hexstr(rel_serial.data, rel_serial.length);
+    int rel_serial_hex_len = strlen(rel_serial_hex);
+
+    // grab the last 'rel_serial_hex_len' bytes from iss_and_ser string
+    char* ext_serial_str = issuer_and_serial + iss_and_serial_len - rel_serial_hex_len;
+    ASN1_INTEGER *ext_serial = ASN1_INTEGER_new();
+    long raw_serial_len;
+    unsigned char* serial_raw = OPENSSL_hexstr2buf(ext_serial_str, &raw_serial_len);
+
+    // create ASN1_INTEGER object from serial num
+    c2i_ASN1_INTEGER(&ext_serial, &serial_raw, raw_serial_len);
+
+    // compare
+    int iss_cmp = strcmp(ext_issuer, rel_issuer);
+    int ser_cmp = ASN1_INTEGER_cmp(&rel_serial, ext_serial);
+
+    int cmp = iss_cmp || ser_cmp;
+    int ok;
+    if(cmp) {
+        // failed
+        printf("ERROR IN ISSUER AND SERIAL COMPARISON");
+        ok = 0;
+    } else {
+        *issuer = rel_issuer;
+        *serial = rel_serial.data;
+        ok = 1;
+    }
+
+    return ok;
 }
 
 int validate_binary_time(unsigned int binary_time) {
@@ -278,7 +282,7 @@ int validate_binary_time(unsigned int binary_time) {
     return diff < (60*60*24*365);
 }
 
-int extract_fingerprint(X509* rel_cert, char* tmp_file_name, unsigned char** fingerprint, int* finger_len) {
+int extract_fingerprint(X509* rel_cert, unsigned char** fingerprint, int* finger_len) {
     // get the hashing algorithm used on the related cert
     EVP_MD *alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
 
@@ -286,7 +290,6 @@ int extract_fingerprint(X509* rel_cert, char* tmp_file_name, unsigned char** fin
     unsigned char digest_value[256];
     unsigned int digest_len = 0;
     int ok = X509_digest(rel_cert, alg, &digest_value, &digest_len);
-
     if(!ok) {
         printf("ERROR IN FINGERPRINT EXTRACTION\n");
         return 0;
@@ -300,13 +303,6 @@ int extract_fingerprint(X509* rel_cert, char* tmp_file_name, unsigned char** fin
 }
 
 int validate_related_cert(X509* trusted_cert, X509* rel_cert) {
-    /*TODO:
-        - create the X509* rel cert variable earlier in the process
-        - pass the x509* variable to this function
-        - implement other verification functions using the X509* variable
-            instead of through system commands
-    */
-
     // create store containing the (trusted) cert used to sign the related cert
     X509_STORE* store = X509_STORE_new();
     X509_STORE_add_cert(store, trusted_cert);
@@ -334,19 +330,20 @@ int validate_related_cert(X509* trusted_cert, X509* rel_cert) {
     return 1;
 }
 
-int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, const char* issuer, const char* serial) {
+int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, const char* issuer, const char* serial_raw) {
     /*
         The signature field contains a digital signature over the
         concatenation of DER encoded requestTime and IssuerAndSerialNumber
     */
-    // reconstruct the signed data
     // TODO: signed_data ?= concat(DER(time), DER(iss and ser))
 
+    // setup
+    char* serial = OPENSSL_buf2hexstr(serial_raw, strlen(serial_raw));
     char data[256];
     sprintf(data, "%u", requestTime);
-
     int data_len = strlen(data) + strlen(issuer) + strlen(serial);
 
+    // reconstruct the signed data
     strcat(data, issuer);
     strcat(data, serial);
     data[data_len] = '\0';
@@ -364,7 +361,6 @@ int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, 
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     int ok = EVP_DigestVerifyInit(mdctx, NULL, evp_alg, NULL, pkey);
     ok &= EVP_DigestVerifyUpdate(mdctx, data, data_len);
-
     if(ok != 1) {
         printf("ERROR IN SIGNATURE INITIALIZATION: %d\n", ok);
         return 0;
@@ -372,7 +368,6 @@ int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, 
 
     // verify signature
     ok = EVP_DigestVerifyFinal(mdctx, bin_signature, siglen);
-
     if (ok != 1) {
         printf("ERROR IN SIGNATURE VERIFICATION: %d\n", ok);
         return 0;
