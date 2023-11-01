@@ -7,42 +7,36 @@
  * https://www.openssl.org/source/license.html
  */
 
-#include <curl/curl.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/conf.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
 #include <openssl/objects.h>
 #include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
-/*#include "openssl/apps.h"*/
-#include "crypto/ctype.h"
-/*#include "crypto/x509.h"*/
-#include "ext_dat.h"
-#include "internal/cryptlib.h"
-
-#include "include/crypto/x509.h"
 #include "crypto/asn1.h"
 #include "crypto/evp.h"
-
-/*#include "crypto/x509/x_pubkey.c"*/
+#include "crypto/ctype.h"
+#include "ext_dat.h"
+#include "include/crypto/x509.h"
+#include "internal/cryptlib.h"
 
 const char* tmp_file_name = "./TMP_REL_CERT.crt";
-
-struct X509_pubkey_st {
-    X509_ALGOR *algor;
-    ASN1_BIT_STRING *public_key;
-    EVP_PKEY *pkey;
-};
-typedef struct X509_pubkey_st X509_PUBKEY;
 
 ASN1_SEQUENCE(RELATED_CERTIFICATE) = {
     ASN1_SIMPLE(RELATED_CERTIFICATE, RelatedCertificate, ASN1_OCTET_STRING)
@@ -60,25 +54,57 @@ static int i2r_rel_cert(X509V3_EXT_METHOD *method, RELATED_CERTIFICATE *rel_cert
 }
 
 static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STACK_OF(CONF_VALUE) *values) {
+    // initialize extension ASN1 structure
     RELATED_CERTIFICATE* rel_cert = RELATED_CERTIFICATE_new();
+
+    // extract variables
+    unsigned int binary_time;
+    char* issuer_and_serial;
+    char* signature;
+    char* location_info;
+    char* access_method;
+    char* access_location;
+    int succeeded;
+
+    for(int i = 0; i < sk_CONF_VALUE_num(values); ++i) {
+        CONF_VALUE* value = sk_CONF_VALUE_value(values, i);
+
+        if(strcmp(value->name, "certID") == 0) {
+            issuer_and_serial = value->value;
+        } else if (strcmp(value->name, "requestTime") == 0) {
+            binary_time = atoi(value->value);
+        } else if (strcmp(value->name, "signature") == 0) {
+            signature = value->value;
+        } else if (strcmp(value->name, "locationInfo") == 0) {
+            location_info = value->value;
+            succeeded = extract_access_params(location_info, &access_method, &access_location);
+
+            if(!succeeded) {
+                printf("ERROR: Failed to parse location info.\n");
+                return NULL;
+            }
+        } else {
+            // TODO: add checking for other variables?
+        }
+    }
 
     // pull related certificate into temporary file
     X509 rel_cert_x509;
-    int succeeded = get_related_cert(&rel_cert_x509, values);
+    succeeded = get_related_cert(&rel_cert_x509, access_location);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
 
     // validate certificate
-    succeeded = validate_certificate(&rel_cert_x509, tmp_file_name, values, ctx);
+    succeeded = validate_certificate(&rel_cert_x509, tmp_file_name, binary_time, issuer_and_serial, signature, ctx);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
     
     // extract fingerprint from related certificate
-    unsigned char* fingerprint;
+    char* fingerprint;
     unsigned int finger_len;
     succeeded = extract_fingerprint(&rel_cert_x509, &fingerprint, &finger_len);
 
@@ -97,51 +123,303 @@ static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STAC
     return rel_cert;
 }
 
-int get_related_cert(X509* rel_cert, STACK_OF(CONF_VALUE)* values) {
+int extract_access_params(char* location_info, char** access_method, char** access_location) {
+    // setup
+    char loc_copy[strlen(location_info)];
+    strcpy(loc_copy, location_info);
+
+    // skip past "accessMethod = "
+    if(strlen(loc_copy) < 16) {
+        printf("ERROR: accessLocation string invalid\n");
+        return 0;
+    }
+    memmove(loc_copy, loc_copy + 15, strlen(loc_copy));
+
+    // split at ","
+    char* method_str = strtok(loc_copy, ",");
+    char* location_str = strtok(NULL, ",");
+
+    // skip past " accessLocation = "
+    memmove(location_str, location_str + 18, strlen(location_str));
+
+    *access_method = method_str;
+    *access_location = location_str;
+
+    return 1;
+}
+
+int get_related_cert(X509* rel_cert, char* access_location) {
     /** TODO:
-      * instead of accessing a local filepath, perform the following:
-      *   - extract accessLocation from values
-      *   - use curl (or an OQS internal package) to access the related cert
-      *   - store file directly into 'tmp_file'
+        Add authentication?
+        Use built in SSL_* objects to make FTP/HTTP requests instead of c sockets?
     **/
 
-    // get related certificate
-    /*CURL *curl = curl_easy_init();*/
-    /*CURLcode res;*/
-    /*if(curl) {*/
-    /*curl_easy_setopt(curl, CURLOPT_URL, "http://0.0.0.0:8000/dil5_rsa4096_hybrid.crt");*/
-    /*res = curl_easy_perform(curl);*/
+    char* proto = "http"; // default: http
+    char* address;
+    char* filepath = '/';
+    int port = 80;
+    char loc_copy[strlen(access_location)];
+    strcpy(loc_copy, access_location);
 
-    /*if(res != CURLE_OK)*/
+    char* token = strtok(loc_copy, ":");
+    if(strlen(token) == strlen(access_location)) { // no ':' found
+        // default to http
 
-    /*curl_easy_cleanup(curl);*/
-    /*}*/
+        // parse out filepath
+        char *fp_token = strchr(token, ' ');
+        if(fp_token) {
+            filepath = fp_token;
 
-    FILE* tmp_file = fopen(tmp_file_name, "w");
+            // recover address
+            int addr_len = fp_token - token;
+            strncpy(address, token, addr_len);
+        } else {
+            strcpy(address, token);
+        }
+    } else if(strcmp(token, "http") && strcmp(token, "ftp")) {
+        // incorrect protocol or none included
+        address = token;
 
-    if(!tmp_file) {
+        token = strtok(NULL, ":");
+        if(token) {
+            port = atoi(token);
+        }
+
+        // parse out filepath
+        char *fp_token = strchr(token, '/');
+        if(fp_token) {
+            filepath = fp_token;
+        }
+    } else {
+        proto = token;
+        if(!strcmp(token, "ftp")) {
+            port = 21;
+        }
+
+        token = strtok(NULL, ":");
+        token = token + 2; // remove "//" in "proto://"
+        address = token;
+        token = strtok(NULL, ":");
+        if(token) {
+            port = atoi(token);
+        }
+
+        // parse out filepath
+        char *fp_token = strchr(token, '/');
+        if(fp_token) {
+            filepath = fp_token;
+        }
+    }
+
+    // establish a connection
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, address, &addr.sin_addr);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if(sock < 0) {
+        printf("ERROR: Unable to create socket. %d\n", sock);
         return 0;
     }
 
-    FILE* in_file = fopen("/home/ubuntu/ra/related-certs-ra/certs/signed_rsa4096.crt", "r");
-    if(!in_file) {
+    int succ = connect(sock, (struct sockaddr*) &addr, sizeof(addr));
+    if(succ < 0) {
+        printf("ERROR: Unable to bind. %d\n", succ);
         return 0;
     }
 
-    int buff_size = 16192; // TODO: optimize
-    char rel_cert_buff[buff_size];
+    if(!strcmp(proto, "http")) {
+        // create request string
+        char req_string[15 + strlen(filepath)];
+        strcpy(req_string, "GET ");
+        strcat(req_string, filepath);
+        strcat(req_string, " HTTP/1.0\n\n");
 
-    // extract certificate into temporary file
-    while(fgets(rel_cert_buff, buff_size, in_file)) {
-        fputs(rel_cert_buff, tmp_file);
+        // send http request
+        send(sock, req_string, strlen(req_string), 0);
+
+        // create temp file to store rel cert
+        FILE* tmp_file = fopen(tmp_file_name, "w");
+        if(!tmp_file) {
+            printf("ERROR: Could not create tmp file\n");
+            return 0;
+        }
+
+        // pull related cert
+        int buf_len = 4096;
+        char* buf[buf_len];
+        int bytes_rec = 0;
+        do {
+            // TODO: add delays to prevent race conditions? add retries/timeouts?
+            bytes_rec = read(sock, buf, buf_len);
+            succ = fputs(buf, tmp_file);
+            if(succ <= 0) {
+                printf("ERROR: fputs failed\n");
+                return 0;
+            }
+        } while (bytes_rec != 0);
+        
+        // cleanup
+        fclose(tmp_file);
+    } else { // ftp
+        // TODO: secure authentication? meh.
+        // TODO: sleep more optimally?
+
+        // error checking, woooo
+        int success_codes[6] = {220, 331, 230, 227, 125, 226};
+        char* error_msgs[6] = {
+            "Failed to establish session.\n",
+            "Invalid Username.\n",
+            "Failed to authenticate with FTP server.\n",
+            "Failed to establish session.\n",
+            "Failed to initiate data transfer.\n",
+            "Failed to complete data transfer.\n"
+        };
+        int i = 0;
+        char status_code[4];
+        char *token;
+
+        // sign in anonymously
+        char* anon_auth = "USER anonymous\r\nPASS anonymous\r\n";
+        send(sock, anon_auth, strlen(anon_auth), 0);
+        sleep(1);
+
+        // connect to server
+        char conn_status[256];
+        int num_bytes = read(sock, conn_status, 255);
+        conn_status[num_bytes] = '\0';
+ 
+        // verify status codes
+        token = strtok(conn_status, "\n");
+        do {
+            strncpy(status_code, token, 3);
+            status_code[3] = '\0';
+            if(atoi(status_code) != success_codes[i]) {
+                printf("ERROR: %s\n", error_msgs[i]);
+                return 0;
+            }
+            
+            token = strtok(NULL, "\n");
+            i++;
+        } while(token != NULL);
+
+        // intiate passive mode for data transfer
+        char *pasv_mes = "PASV\r\n";
+        char pasv_resp[256];
+        send(sock, pasv_mes, strlen(pasv_mes), 0);
+        sleep(1);
+        num_bytes = read(sock, pasv_resp, 255);
+        pasv_resp[num_bytes] = '\0';
+
+        // verify status codes
+        token = strtok(pasv_resp, "\n");
+        char ip_mes[256];
+        do {
+            strncpy(status_code, token, 3);
+            status_code[3] = '\0';
+            if(atoi(status_code) != success_codes[i]) {
+                printf("ERROR: %s\n", error_msgs[i]);
+                return 0;
+            }
+
+            // extract pasv port message
+            if(success_codes[i] == 227)
+                strncpy(ip_mes, token, strlen(token));
+
+            i++;
+            token = strtok(NULL, "\n");
+        } while(token != NULL);
+
+        // get new port for data transfer
+        char message[100];
+        char ip1[10], ip2[10], ip3[10], ip4[10], p1[10], p2[10];
+        int num_sects = sscanf(ip_mes, "%[^(](%[^,],%[^,],%[^,],%[^,],%[^,],%[^)])", message, ip1, ip2, ip3, ip4, p1, p2);
+
+        if(num_sects != 7) {
+            printf("ERROR: PASV mode message is unparcable.\n");
+            printf("number of sections: %d\n", num_sects);
+            printf("message: %s\n", ip_mes);
+        }
+        int data_port = atoi(p1)*256 + atoi(p2);
+
+        // make new socket for file transfer
+        struct sockaddr_in addr2;
+        addr2.sin_family = AF_INET;
+        addr2.sin_port = htons(data_port);
+        inet_pton(AF_INET, address, &addr2.sin_addr);
+
+        int sock2 = socket(AF_INET, SOCK_STREAM, 0);
+        if(sock2 < 0) {
+            printf("ERROR: Unable to create socket. %d\n", sock2);
+            return 0;
+        }
+
+        int succ = connect(sock2, (struct sockaddr*) &addr2, sizeof(addr2));
+        if(succ < 0) {
+            printf("ERROR: Unable to bind. %d\n", succ);
+            return 0;
+        }        
+
+        // create request string
+        char retr_mes[15 + strlen(filepath)];
+        strcpy(retr_mes, "RETR ");
+        strcat(retr_mes, filepath);
+        strcat(retr_mes, "\r\n");
+
+        // initiate transfer
+        char retr_resp[256];
+        send(sock, retr_mes, strlen(retr_mes), 0);
+        sleep(1);
+        num_bytes = read(sock, retr_resp, 255);
+        retr_resp[num_bytes] = '\0';
+
+        // verify status
+        token = strtok(retr_resp, "\n");
+        do {
+            strncpy(status_code, token, 3);
+            status_code[3] = '\0';
+            if(atoi(status_code) != success_codes[i]) {
+                printf("ERROR: %s\n", error_msgs[i]);
+                return 0;
+            }
+
+            token = strtok(NULL, "\n");
+            i++;
+        } while(token != NULL);
+
+        // create temp file to store rel cert
+        FILE* tmp_file = fopen(tmp_file_name, "w");
+        if(!tmp_file) {
+            printf("ERROR: Could not create tmp file\n");
+            return 0;
+        }
+
+        // pull related cert
+        int buf_len = 4096;
+        char* buf[buf_len];
+        int bytes_rec = 0;
+        do {
+            bytes_rec = read(sock2, buf, buf_len);
+            succ = fputs(buf, tmp_file);
+            if(succ <= 0) {
+                printf("ERROR: fputs failed\n");
+                return 0;
+            }
+        } while (bytes_rec != 0);
+
+        // cleanup
+        fclose(tmp_file);
+        close(sock2);
     }
+    close(sock);
 
-    // cleanup
-    fclose(in_file);
-    fclose(tmp_file);
-
-    // load related cert file into BIO
+    // create a new BIO to read the pulled cert
     BIO *rel_bio = BIO_new_file(tmp_file_name, "r");
+    if(!rel_bio) {
+        printf("ERROR: rel bio DNE\n");
+        return 0;
+    }
 
     // extract related cert into X509 object
     X509* retrieved_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
@@ -152,31 +430,10 @@ int get_related_cert(X509* rel_cert, STACK_OF(CONF_VALUE)* values) {
     }
 
     *rel_cert = *retrieved_cert;
-
     return 1;
 } 
 
-int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALUE)* values, X509V3_CTX *ctx) {
-    // extract variables
-    unsigned int binary_time;
-    char* issuer_and_serial;
-    char* signature;
-
-    for(int i = 0; i < sk_CONF_VALUE_num(values); ++i) {
-        CONF_VALUE* value = sk_CONF_VALUE_value(values, i);
-
-        if(strcmp(value->name, "certID") == 0) {
-            issuer_and_serial = value->value;
-        } else if (strcmp(value->name, "requestTime") == 0) {
-            char* binary_time_str = value->value;
-            binary_time = atoi(value->value);
-        } else if (strcmp(value->name, "signature") == 0) {
-            signature = value->value;
-        } else {
-            // TODO: add checking for other variables
-        }
-    }
-
+int validate_certificate(X509* rel_cert, char* tmp_file_name, int binary_time, char* issuer_and_serial, char* signature, X509V3_CTX *ctx) {
     // get trusted CA root cert
     // TODO: not hardcode the trusted cert
     char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
@@ -185,7 +442,7 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
 
     // verify issuers and serial numbers match
     char* issuer;
-    char* serial;
+    unsigned char* serial;
     int succeeded = validate_issuer_and_serial(rel_cert, tmp_file_name, issuer_and_serial, &issuer, &serial);
 
     if(!succeeded) {
@@ -213,7 +470,7 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, STACK_OF(CONF_VALU
     return 1;
 }
 
-int validate_issuer_and_serial(X509* rel_cert, char* tmp_file_name, char* issuer_and_serial, char** issuer, char** serial) {
+int validate_issuer_and_serial(X509* rel_cert, char* tmp_file_name, char* issuer_and_serial, char** issuer, unsigned char** serial) {
     long iss_and_serial_len = strlen(issuer_and_serial);
     
     // extract issuer data from rel_cert into a BIO
@@ -282,7 +539,7 @@ int validate_binary_time(unsigned int binary_time) {
     return diff < (60*60*24*365);
 }
 
-int extract_fingerprint(X509* rel_cert, unsigned char** fingerprint, int* finger_len) {
+int extract_fingerprint(X509* rel_cert, char** fingerprint, int* finger_len) {
     // get the hashing algorithm used on the related cert
     EVP_MD *alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
 
@@ -330,7 +587,7 @@ int validate_related_cert(X509* trusted_cert, X509* rel_cert) {
     return 1;
 }
 
-int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, const char* issuer, const char* serial_raw) {
+int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, const char* issuer, const unsigned char* serial_raw) {
     /*
         The signature field contains a digital signature over the
         concatenation of DER encoded requestTime and IssuerAndSerialNumber
@@ -350,14 +607,13 @@ int verify_signature(char* signature, X509* rel_cert, unsigned int requestTime, 
 
     // extract public key from related certificate
     EVP_PKEY *pkey = X509_get0_pubkey(rel_cert);
-    EVP_PKEY_CTX *pkey_ctx = EVP_PKEY_CTX_new(pkey, NULL);
 
     // convert hex to binary
     long siglen;
     unsigned char *bin_signature = OPENSSL_hexstr2buf(signature, &siglen);
 
     // initialize verification procedure
-    EVP_MD *evp_alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
+    const EVP_MD *evp_alg = EVP_get_digestbyobj(rel_cert->sig_alg.algorithm);
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     int ok = EVP_DigestVerifyInit(mdctx, NULL, evp_alg, NULL, pkey);
     ok &= EVP_DigestVerifyUpdate(mdctx, data, data_len);
