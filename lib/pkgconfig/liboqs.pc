@@ -1,0 +1,10 @@
+prefix=/home/ubuntu/public_related_certs/openssl-rel-cert
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: liboqs
+Description: Library for quantum-safe cryptographic algorithms
+Version: 0.9.0-dev
+Requires.private: openssl
+Cflags: -I${includedir}
+Libs: -L${libdir} -loqs

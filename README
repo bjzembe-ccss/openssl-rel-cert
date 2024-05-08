@@ -1,3 +1,21 @@
+ DEVELOPER'S NOTE:
+
+ This version of the related-certs-development branch was an attempt to implement
+ the retrieval of the related certificate chain via a pkcs7 object. Unfortunately,
+ a variety of issues were encountered. For one, I am leaving my current job, and
+ therefore only have a limited amount of time to troubleshoot. Second, for reasons
+ I haven't been able to figure out, PEM_read_bio_PKCS7 is creating an object with
+ an NID related to smime/emails rather than that of a pkcs7 object, which causes
+ PKCS7_verify and PKCS7_get0_signers to fail, which are both necessary in order
+ to either automatically verify the related cert chain or to extract the chain
+ into individual x509_st objects for manual verification. In this version, I
+ modified the code for reading in any file in general, so I believe without
+ modifications, reading in a self-signed related certificate will also fail.
+ At this time, the related-certs-development branch has a functioning
+ implementation in this regard, although the signed certificate for the
+ related cert must exist at a hardcoded filepath specified in crypto/x509v3/v3_related_cert.c
+
+
 
  OpenSSL 1.1.1u 30 May 2023
 

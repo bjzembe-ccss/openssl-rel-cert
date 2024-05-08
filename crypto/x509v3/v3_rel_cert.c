@@ -68,7 +68,6 @@ static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STAC
 
     for(int i = 0; i < sk_CONF_VALUE_num(values); ++i) {
         CONF_VALUE* value = sk_CONF_VALUE_value(values, i);
-
         if(strcmp(value->name, "certID") == 0) {
             issuer_and_serial = value->value;
         } else if (strcmp(value->name, "requestTime") == 0) {
@@ -90,14 +89,15 @@ static void* v2i_rel_cert(const X509V3_EXT_METHOD *method, X509V3_CTX *ctx, STAC
 
     // pull related certificate into temporary file
     X509 rel_cert_x509;
-    succeeded = get_related_cert(&rel_cert_x509, access_location);
+    PKCS7 rel_cert_store;
+    succeeded = get_related_cert(&rel_cert_x509, &rel_cert_store, access_location);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
     }
 
     // validate certificate
-    succeeded = validate_certificate(&rel_cert_x509, tmp_file_name, binary_time, issuer_and_serial, signature, ctx);
+    succeeded = validate_certificate(&rel_cert_x509, &rel_cert_store, tmp_file_name, binary_time, issuer_and_serial, signature, ctx);
     if(!succeeded) {
         RELATED_CERTIFICATE_free(rel_cert);
         return NULL;
@@ -148,7 +148,7 @@ int extract_access_params(char* location_info, char** access_method, char** acce
     return 1;
 }
 
-int get_related_cert(X509* rel_cert, char* access_location) {
+int get_related_cert(X509* rel_cert, PKCS7* rel_cert_store, char* access_location) {
     /** TODO:
         Add authentication?
         Use built in SSL_* objects to make FTP/HTTP requests instead of c sockets?
@@ -338,8 +338,6 @@ int get_related_cert(X509* rel_cert, char* access_location) {
 
         if(num_sects != 7) {
             printf("ERROR: PASV mode message is unparcable.\n");
-            printf("number of sections: %d\n", num_sects);
-            printf("message: %s\n", ip_mes);
         }
         int data_port = atoi(p1)*256 + atoi(p2);
 
@@ -421,33 +419,78 @@ int get_related_cert(X509* rel_cert, char* access_location) {
         return 0;
     }
 
-    // extract related cert into X509 object
-    X509* retrieved_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
+    // check if file is a chain
+    PKCS7* p7;
+    X509* retrieved_cert;
 
-    if(!retrieved_cert) {
-        printf("ERROR RETRIEVING RELATED CERTIFICATE\n");
-        return 0;
+    char* ext = strchr(filepath, '.');
+    if(!(strcmp(".p7b", ext)
+      && strcmp(".p7c", ext)
+      && strcmp(".p7m", ext)
+      && strcmp(".p7r", ext)
+      && strcmp(".p6s", ext)
+    )){
+        // extract pkcs7 cert chain from bio
+        p7 = PEM_read_bio_PKCS7(rel_bio, NULL, NULL, NULL);
+        /*p7 = d2i_PKCS7_bio(rel_bio, NULL);*/
+
+        if(!p7) {
+            printf("ERROR RETRIEVING PKCS7 STORE\n");
+            return 0;
+        }
+
+        rel_cert_store = p7;
+    } else {
+        // extract related cert into X509 object
+        X509* retrieved_cert = PEM_read_bio_X509(rel_bio, NULL, 0, NULL);
+        if(!retrieved_cert) {
+            printf("ERROR RETRIEVING RELATED CERTIFICATE\n");
+            return 0;
+        }
+        rel_cert = retrieved_cert;
     }
 
-    *rel_cert = *retrieved_cert;
     return 1;
 } 
 
-int validate_certificate(X509* rel_cert, char* tmp_file_name, int binary_time, char* issuer_and_serial, char* signature, X509V3_CTX *ctx) {
-    // get trusted CA root cert
-    // TODO: not hardcode the trusted cert
-    char* trusted_file = "/home/ubuntu/ca/certs/rsa4096_root.crt";
-    BIO *trusted_bio = BIO_new_file(trusted_file, "r");
-    X509 *trusted_cert = PEM_read_bio_X509(trusted_bio, NULL, 0, NULL);    
+int validate_certificate(X509* rel_cert, PKCS7* rel_cert_store, char* tmp_file_name, int binary_time, char* issuer_and_serial, char* signature, X509V3_CTX *ctx) {
+    STACK_OF(X509)* trusted_certs = sk_X509_new_null();
 
-    // verify issuers and serial numbers match
+    int succeeded;
+    int found_rel_cert = 0;
     char* issuer;
     unsigned char* serial;
-    int succeeded = validate_issuer_and_serial(rel_cert, tmp_file_name, issuer_and_serial, &issuer, &serial);
+    if(rel_cert_store) {
+        /*
+            For some reason, any pkcs7 files which I create get the NID type of "email" assigned
+            to it, which causes the pkcs7_verify function and the get0_signers function to fail.
+            I really have no idea why this happens, but this needs to be fixed before being able
+            to use any of the pkcs7 functions to extract the related certificate chain
+        */
+        int res = PKCS7_verify(rel_cert_store, NULL, NULL, NULL, NULL, 0);
+        STACK_OF(X509)* all_certs = PKCS7_get0_signers(rel_cert_store, NULL, 0);
+        
+        // parse out related certs vs. trusted certs
+        X509* this_cert;
+        while(this_cert = sk_X509_pop(all_certs)) {
+            succeeded = validate_issuer_and_serial(rel_cert, tmp_file_name, issuer_and_serial, &issuer, &serial);
 
-    if(!succeeded) {
-        return 0;
-    }
+            if(succeeded) {
+                // this_cert is the related cert
+                rel_cert = this_cert;
+                found_rel_cert = 1;
+            } else {
+                // this_cert is a trusted cert
+                sk_X509_push(trusted_certs, this_cert);
+            }
+        }
+
+        if(!rel_cert) {
+            printf("ERROR: Could not extract related cert from PKCS7 file.\n");
+            return 0;
+        }
+
+    } // else, related cert should be self signed
 
     // verify the binary time is sufficiently fresh
     succeeded = validate_binary_time(binary_time);
@@ -456,7 +499,7 @@ int validate_certificate(X509* rel_cert, char* tmp_file_name, int binary_time, c
     }
 
     // validate the related certificate
-    succeeded = validate_related_cert(trusted_cert, rel_cert);
+    succeeded = validate_related_cert(trusted_certs, rel_cert);
     if(!succeeded) {
         return 0;
     }
@@ -559,10 +602,14 @@ int extract_fingerprint(X509* rel_cert, char** fingerprint, int* finger_len) {
     return 1;
 }
 
-int validate_related_cert(X509* trusted_cert, X509* rel_cert) {
-    // create store containing the (trusted) cert used to sign the related cert
+int validate_related_cert(STACK_OF(X509)* trusted_certs, X509* rel_cert) {
+    // create store containing the (trusted) certs used to sign the related cert
     X509_STORE* store = X509_STORE_new();
-    X509_STORE_add_cert(store, trusted_cert);
+
+    X509* this_cert;
+    while(this_cert = sk_X509_pop(trusted_certs)) {
+        X509_STORE_add_cert(store, this_cert);
+    }
     X509_STORE_set_default_paths(store);
 
     // add related cert to a chain of certs to be verified
